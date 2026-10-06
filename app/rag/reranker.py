@@ -37,9 +37,15 @@ class CrossEncoderReranker:
         try:
             import os
 
-            cache_root = os.path.join(
-                os.path.expanduser("~"), ".cache", "huggingface", "hub"
-            )
+            # ★ 优先读 HF_HOME，回退到默认路径
+            hf_home = os.environ.get("HF_HOME")
+            if hf_home:
+                cache_root = os.path.join(hf_home, "hub")
+            else:
+                cache_root = os.path.join(
+                    os.path.expanduser("~"), ".cache", "huggingface", "hub"
+                )
+
             repo_dir = os.path.join(
                 cache_root, "models--" + model_name.replace("/", "--")
             )

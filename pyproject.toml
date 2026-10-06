@@ -1,5 +1,5 @@
 [project]
-name = "omnirag"
+name = "SmartRAG"
 version = "1.0.0"
 description = "Multi-agent hybrid RAG research platform"
 requires-python = ">=3.11"

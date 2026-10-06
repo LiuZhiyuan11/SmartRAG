@@ -21,7 +21,15 @@ import tempfile
 import threading
 import time
 import uuid
+from tkinter import image_names
 from typing import Optional
+from pathlib import Path
+from fastapi import UploadFile,File
+import uuid
+
+# 图片文件上传文件夹
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
 
 # 确保项目根目录在 sys.path 中（python -m uvicorn 时 cwd 可能不在项目根）
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -152,6 +160,7 @@ class QueryRequest(BaseModel):
     thread_id: Optional[str] = Field(
         None, description="会话 ID（不传则自动生成新会话）"
     )
+    image_path: str = ""
 
 
 class QueryResponse(BaseModel):
@@ -249,7 +258,9 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
 
     async def event_gen():
         try:
-            async for event in stream_query(req.query, thread_id):
+            async for event in stream_query(req.query,
+                                            thread_id,
+                                            image_path=req.image_path):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except Exception as e:
             logger.exception("流式查询失败")
@@ -354,6 +365,43 @@ async def ingest_file_endpoint(file: UploadFile = File(...)) -> IngestResponse:
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """接收前端上传的图片，保存到本地，返回路径"""
+    original_name = file.filename or ""
+    logger.info(
+        "图片上传开始: filename=%s content_type=%s",
+        original_name,
+        file.content_type,
+    )
+
+    # 1、生成唯一文件名，防止冲突
+    ext = Path(original_name).suffix.lower()
+    if ext not in ['.jpg', '.jpeg', '.png', '.bmp', '.webp']:
+        logger.warning("图片上传拒绝: filename=%s extension=%s", original_name, ext)
+        raise HTTPException(status_code=400, detail="不支持的图片格式")
+    # 生成随即名，减少重名冲突
+    filename = f"{uuid.uuid4().hex}{ext}"
+    save_path = UPLOAD_DIR / filename
+
+    # 2、写入磁盘
+    content = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(content)
+    logger.info(
+        "图片已保存: filename=%s bytes=%d path=%s",
+        original_name,
+        len(content),
+        save_path.resolve(),
+    )
+
+    # 3、返回绝对路径(因为YOLO模型需要绝对路径)
+    return {
+        "image_path": str(save_path.resolve()),
+        "file_name": original_name,
+    }
+
 
 
 @app.post("/api/ingest/text", response_model=IngestResponse)

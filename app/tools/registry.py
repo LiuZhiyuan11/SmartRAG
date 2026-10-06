@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.tools import tool
+import asyncio
 
 # ── 路由决策工具 schema（OpenAI function calling 格式）──────────────────────
 # LangChain bind_tools 接受此 dict 列表，GLM-4-Flash 会返回 tool_calls。
@@ -85,6 +87,37 @@ ROUTING_TOOLS: list[dict[str, Any]] = [
             "required": ["query"],
         },
     },
+
+{
+        "name": "get_weather",
+        "description": (
+            "查询指定城市的当前天气，包括天气状况、气温、体感温度、"
+            "湿度、风速和降水量。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string",
+                         "description": "查询指定城市的当前天气。city 必须是城市名称；从用户问题或对话历史中提取，不要把整句问题作为城市。"},
+            },
+            "required": ["city"],
+        },
+    },
+
+{
+        "name": "object_detection",
+        "description": (
+            "使用 YOLO11n 模型进行目标检测，识别图像中的物体并返回检测结果。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "image_path": {"type": "string", "description": "图像文件路径或 URL，例如：/path/to/image.jpg 或 https://example.com/image.jpg"},
+            },
+            "required": ["image_path"],
+        },
+    },
+
 ]
 
 
@@ -95,6 +128,8 @@ TOOL_TO_ROUTE: dict[str, str] = {
     "rag_search": "rag_agent",
     "web_search": "web_agent",
     "parallel_search": "both",
+    "get_weather": "weather_node",
+    "object_detection": "detection_node",
     "direct_answer": "synthesis",  # direct_answer=True，走 synthesis 直接回答
 }
 
@@ -147,6 +182,43 @@ def get_mcp_tools() -> list:
         inputSchema=web_schema,
     ))
 
+    # 天气查询工具
+    tools.append(Tool(
+        name="get_weather",
+        description=(
+            "查询指定城市的当前天气，包括天气状况、气温、体感温度、"
+            "湿度、风速和降水量等信息。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "location": {
+                    "type": "string",
+                    "description": "城市名称，例如：北京、Shanghai",
+                },
+            },
+            "required": ["location"],
+        },
+    ))
+
+    # 识物工具
+    tools.append(Tool(
+        name="object_detection",
+        description=(
+            "使用 YOLO11n 模型进行目标检测，识别图像中的物体并返回检测结果。"
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "image_path": {
+                    "type": "string",
+                    "description": "图像文件路径或 URL，例如：/path/to/image.jpg 或 https://example.com/image.jpg",
+                },
+            },
+            "required": ["image_path"],
+        },
+    ))
+
     # 执行型工具（仅 MCP 对外）
     tools.append(Tool(
         name="full_query",
@@ -187,3 +259,15 @@ def get_mcp_tools() -> list:
         },
     ))
     return tools
+
+@tool
+async def get_weather(city: str) -> dict[Any, Any]:
+    """查询指定城市的天气"""
+    from app.tools import weather_tool
+    return await weather_tool.get_weather(city)
+
+@tool
+async def object_detection(image_path: str) -> str:
+    """使用 YOLO11n 模型进行目标检测"""
+    from app.tools import vision_tool
+    return await asyncio.to_thread(vision_tool.vision_service.detect, image_path,)

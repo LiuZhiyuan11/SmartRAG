@@ -5,7 +5,6 @@ OmniRAG — 混合检索器
 + Cross-Encoder 重排序。支持通过 LLM 提取结构化过滤器进行元数据过滤。
 """
 
-import hashlib
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -21,7 +20,8 @@ from app.rag.ingestion import get_vector_store
 from app.rag.reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
-
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
 # ── 过滤器提取模式 ────────────────────────────────────────────────────────────
 
@@ -83,7 +83,8 @@ class HybridRetriever(BaseRetriever):
             base = HybridRetriever(
                 top_k=self.top_k,
                 reranker_top_n=self.reranker_top_n,
-                use_reranking=self.use_reranking,
+                # use_reranking=self.use_reranking,
+                use_reranking=False,    # 关掉子检索精排
                 use_filter_extraction=self.use_filter_extraction,
                 use_multi_query=False,  # 防止递归
             )
@@ -167,15 +168,35 @@ class MultiQueryRetriever:
 
     def retrieve(self, query: str) -> List[Document]:
         queries = self._generate_queries(query)
-        all_docs: Dict[str, Document] = {}
+        logger.info("多查询变体: %s", queries)
+        #  使用线程池进行多变体并发查询
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            results = list(executor.map(self.base_retriever.invoke, queries))
 
-        for q in queries:
-            docs = self.base_retriever.invoke(q)
+        all_docs: Dict[str, Document] = {}
+        for i, docs in enumerate(results):
+            # docs = self.base_retriever.invoke(q)
+            logger.info("第 %d 路 [%s] 返回 %d 条", i + 1, queries[i], len(docs))
             for doc in docs:
                 key = hashlib.md5(doc.page_content.encode()).hexdigest()
-                all_docs[key] = doc
+                if key not in all_docs:  # 不覆盖
+                    all_docs[key] = doc
 
-        return list(all_docs.values())[:self.base_retriever.reranker_top_n]
+        merged = list(all_docs.values())
+        logger.info("合并去重后共 %d 条，二次精排中...", len(merged))
+
+        # ★ 关键新增：用**原始 query** 二次精排，统一分数尺度
+        if len(merged) > self.base_retriever.reranker_top_n:
+            reranker = CrossEncoderReranker(top_n=self.base_retriever.reranker_top_n)
+            merged = reranker.rerank(query, merged)
+            logger.info("二次精排后保留 %d 条，最高分 %.3f",
+                        len(merged), merged[0].metadata.get("rerank_score", 0))
+        else:
+            logger.info("合并后条数不足，直接返回 %d 条", len(merged))
+
+        return merged[:self.base_retriever.reranker_top_n]
+        # logger.info("合并去重后共 %d 条，截取前 %d 条", len(all_docs), self.base_retriever.reranker_top_n)
+        # return list(all_docs.values())[:self.base_retriever.reranker_top_n]
 
     def _generate_queries(self, query: str) -> List[str]:
         prompt = ChatPromptTemplate.from_messages([

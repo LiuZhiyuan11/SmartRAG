@@ -1,4 +1,4 @@
-name: OmniRAG CI/CD Pipeline
+name: SmartRAG CI/CD Pipeline
 
 on:
   push:

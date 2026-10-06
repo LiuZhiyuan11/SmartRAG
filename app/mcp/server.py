@@ -4,6 +4,7 @@ OmniRAG — MCP 服务器
 自定义 Model Context Protocol 服务器，工具 schema 由 app.tools.registry 统一管理：
   • rag_search   — 混合检索知识库（Dense+Sparse RRF + Cross-Encoder 重排序）
   • web_search   — Tavily 实时网络搜索（代理绕过 + 双重保障）
+  • weather      — Open-Meteo 当前天气查询（无需 API Key）
   • full_query   — 跑完整多 Agent 工作流（监督者→检索→综合→评审）
   • evaluate     — 对黄金集跑 RAGAS 4 维评估（faithfulness / answer_relevancy / context_precision / context_recall）
 
@@ -70,6 +71,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return await _rag_search(**arguments)
     elif name == "web_search":
         return await _web_search(**arguments)
+    elif name == "get_weather":
+        return await _weather(**arguments)
     elif name == "full_query":
         return await _full_query(**arguments)
     elif name == "evaluate":
@@ -136,6 +139,93 @@ async def _web_search(query: str, max_results: int = 5) -> list[TextContent]:
     except Exception as e:
         logger.error("web_search 错误: %s", e)
         return [TextContent(type="text", text=f"网络搜索错误: {e}")]
+
+
+async def _weather(location: str) -> list[TextContent]:
+    """通过 Open-Meteo 地理编码与天气 API 查询城市当前天气，无需 API Key。"""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            geo_response = await client.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={
+                    "name": location,
+                    "count": 1,
+                    "language": "zh",
+                    "format": "json",
+                },
+            )
+            geo_response.raise_for_status()
+            locations = geo_response.json().get("results", [])
+            if not locations:
+                return [TextContent(type="text", text=f"未找到地点：{location}")]
+
+            place = locations[0]
+            weather_response = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": place["latitude"],
+                    "longitude": place["longitude"],
+                    "current": (
+                        "temperature_2m,relative_humidity_2m,apparent_temperature,"
+                        "precipitation,weather_code,wind_speed_10m"
+                    ),
+                    "timezone": "auto",
+                },
+            )
+            weather_response.raise_for_status()
+            current = weather_response.json()["current"]
+    except httpx.HTTPError as e:
+        logger.error("weather 查询错误: %s", e)
+        return [TextContent(type="text", text=f"天气查询失败：{e}")]
+
+    description = _weather_description(current["weather_code"])
+    place_name = ", ".join(
+        part for part in (place.get("name"), place.get("admin1"), place.get("country")) if part
+    )
+    text = (
+        f"{place_name} 当前天气（{current['time']}）\n"
+        f"天气：{description}\n"
+        f"气温：{current['temperature_2m']}°C（体感 {current['apparent_temperature']}°C）\n"
+        f"湿度：{current['relative_humidity_2m']}%\n"
+        f"风速：{current['wind_speed_10m']} km/h\n"
+        f"降水量：{current['precipitation']} mm"
+    )
+    return [TextContent(type="text", text=text)]
+
+
+def _weather_description(code: int) -> str:
+    """将 Open-Meteo WMO 天气代码转换为中文描述。"""
+    if code == 0:
+        return "晴"
+    if code in (1, 2, 3):
+        return {1: "大致晴朗", 2: "局部多云", 3: "阴"}[code]
+    if code in (45, 48):
+        return "有雾"
+    if code in (51, 53, 55, 56, 57):
+        return "毛毛雨"
+    if code in (61, 63, 65, 66, 67):
+        return "雨"
+    if code in (71, 73, 75, 77):
+        return "降雪"
+    if code in (80, 81, 82):
+        return "阵雨"
+    if code in (85, 86):
+        return "阵雪"
+    if code in (95, 96, 99):
+        return "雷暴"
+    return f"未知天气（代码 {code}）"
+
+async def detect_objects(image_path: str) -> list[TextContent]:
+    """使用 YOLO11n 模型进行目标检测"""
+    try:
+        from app.tools.vision_tool import vision_service
+        result = await vision_service.detect(image_path)
+        return [TextContent(type="text", text=result)]
+    except Exception as e:
+        logger.error("object_detection 错误: %s", e)
+        return [TextContent(type="text", text=f"目标检测失败: {e}")]
 
 
 async def _full_query(

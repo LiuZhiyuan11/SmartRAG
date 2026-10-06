@@ -362,6 +362,58 @@ class TestMCPRagSearch:
         assert "测试内容" in result[0].text
 
 
+class TestMCPWeather:
+    @pytest.mark.asyncio
+    async def test_weather_returns_current_conditions(self):
+        from app.mcp.server import _weather
+
+        class FakeResponse:
+            def __init__(self, data):
+                self.data = data
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return self.data
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                self.responses = [
+                    FakeResponse({"results": [{
+                        "name": "北京", "admin1": "北京市", "country": "中国",
+                        "latitude": 39.9, "longitude": 116.4,
+                    }]}),
+                    FakeResponse({"current": {
+                        "time": "2026-10-01T11:00", "temperature_2m": 22,
+                        "apparent_temperature": 21, "relative_humidity_2m": 45,
+                        "wind_speed_10m": 8, "precipitation": 0, "weather_code": 0,
+                    }}),
+                ]
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def get(self, url, params):
+                return self.responses.pop(0)
+
+        with patch("httpx.AsyncClient", FakeClient):
+            result = await _weather("北京")
+
+        assert "北京" in result[0].text
+        assert "天气：晴" in result[0].text
+        assert "气温：22°C" in result[0].text
+
+    def test_weather_tool_is_exposed_to_mcp(self):
+        from app.tools.registry import get_mcp_tools
+
+        weather_tool = next(tool for tool in get_mcp_tools() if tool.name == "weather")
+        assert weather_tool.inputSchema["required"] == ["location"]
+
+
 # ── critique_node max_iterations 参数化 ───────────────────────────────────────
 
 class TestCritiqueMaxIterations:

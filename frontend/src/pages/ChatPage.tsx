@@ -15,6 +15,8 @@ import {
   Sparkles,
   Timer,
   Trash2,
+  Image as ImageIcon,
+  X,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -78,7 +80,7 @@ interface Conversation {
 
 function loadConversations(): Conversation[] {
   try {
-    const raw = localStorage.getItem("omnirag_conversations")
+    const raw = localStorage.getItem("smartrag_conversations")
     if (!raw) return []
     return JSON.parse(raw)
   } catch {
@@ -87,7 +89,7 @@ function loadConversations(): Conversation[] {
 }
 
 function saveConversations(convs: Conversation[]) {
-  localStorage.setItem("omnirag_conversations", JSON.stringify(convs))
+  localStorage.setItem("smartrag_conversations", JSON.stringify(convs))
 }
 
 function RouteBadge({ route }: { route?: string }) {
@@ -239,6 +241,12 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
   const [turns, setTurns] = useState<Turn[]>([])
   const [input, setInput] = useState("")
   const [streaming, setStreaming] = useState(false)
+
+  const [imagePath, setImagePath] = useState("")              // 上传后的图片路径
+  const [imagePreview, setImagePreview] = useState("")          // 上传图片的预览
+  const [uploading, setUploading] = useState(false)           // 上传中标记
+  const fileInputRef = useRef<HTMLInputElement>(null)     // 隐藏的文件选择框引用
+
   const threadIdRef = useRef<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
 
@@ -306,9 +314,43 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
     })
   }
 
+    async function handleImageUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setUploading(true)
+
+    // 本地预览
+    const reader = new FileReader()
+    reader.onload = (ev) => setImagePreview(ev.target?.result as string)
+    reader.readAsDataURL(file)
+
+    // 上传到后端
+    const formData = new FormData()
+    formData.append("file", file)
+
+    try {
+      const res = await fetch("/api/upload", { method: "POST", body: formData })
+      const data = await res.json()
+      if (data.image_path) {
+        setImagePath(data.image_path)
+      } else {
+        alert("上传失败: " + (data.error || "未知错误"))
+        setImagePreview("")
+      }
+    } catch (err) {
+      alert("上传出错: " + String(err))
+      setImagePreview("")
+    } finally {
+      setUploading(false)
+      // 清空 input，让同一个文件也能再次上传
+      if (fileInputRef.current) fileInputRef.current.value = ""
+    }
+  }
+
   async function handleSend(text: string) {
     const query = text.trim()
-    if (!query || streaming) return
+    if (!query && !imagePath || streaming) return
     setInput("")
 
     const assistantId = crypto.randomUUID()
@@ -339,7 +381,7 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
 
     const started = performance.now()
     try {
-      await streamQuery(query, threadIdRef.current, (ev) => {
+      await streamQuery(query, threadIdRef.current,imagePath, (ev) => {
         if (ev.type === "start" && ev.thread_id) {
           threadIdRef.current = ev.thread_id
           // 更新对话的 threadId
@@ -386,6 +428,8 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
           t.id === assistantId ? { ...t, streaming: false, elapsed: (performance.now() - started) / 1000 } : t,
         ),
       )
+      setImagePath("")
+      setImagePreview("")
       setStreaming(false)
     }
   }
@@ -463,7 +507,7 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
                 <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-3xl bg-gradient-to-br from-primary via-indigo-500 to-cyan-400 shadow-xl shadow-primary/30">
                   <Sparkles className="h-7 w-7 text-white" />
                 </div>
-                <h2 className="text-xl font-semibold">OmniRAG 混合研究助手</h2>
+                <h2 className="text-xl font-semibold">SmartRAG 混合研究助手</h2>
                 <p className="mt-2 max-w-md text-sm text-muted-foreground">
                   支持文档知识库 + 实时网络双源检索,答案自动带来源引用,并经评审智能体迭代修订。
                 </p>
@@ -498,7 +542,52 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
 
         {/* 输入区 */}
         <div className="border-t border-border/50 px-6 py-4 backdrop-blur-sm">
+          {/* 图片预览区 */}
+          {imagePreview && (
+            <div className="mx-auto mb-2 flex max-w-3xl items-center gap-3 rounded-xl border border-border/60 bg-card/60 p-2">
+              <img
+                src={imagePreview}
+                alt="预览"
+                className="h-16 w-16 rounded-lg object-cover"
+              />
+              <span className="flex-1 truncate text-xs text-muted-foreground">
+                {uploading ? "上传中..." : "图片已就绪,发送问题即可识别"}
+              </span>
+              <button
+                onClick={() => {
+                  setImagePath("")
+                  setImagePreview("")
+                }}
+                className="rounded p-1 text-muted-foreground transition-colors hover:text-red-400"
+                aria-label="移除图片"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
+
           <div className="mx-auto flex max-w-3xl items-end gap-2 rounded-2xl border border-border/60 bg-card/80 p-2 shadow-xl shadow-black/10 backdrop-blur-sm focus-within:border-primary/50">
+            {/* 隐藏的文件选择框 */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept="image/*"
+              onChange={handleImageUpload}
+              style={{ display: "none" }}
+            />
+
+            {/* 图片上传按钮 */}
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={streaming || uploading}
+              className="h-10 w-10 shrink-0 rounded-xl text-muted-foreground hover:text-primary"
+              aria-label="上传图片"
+            >
+              {uploading ? <Loader2 className="h-4 w-4 animate-spin" /> : <ImageIcon className="h-4 w-4" />}
+            </Button>
+
             <textarea
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -515,7 +604,7 @@ export function ChatPage({ config }: { config: AppConfig | null }) {
             <Button
               size="icon"
               onClick={() => void handleSend(input)}
-              disabled={streaming || !input.trim()}
+              disabled={streaming || (!input.trim() && !imagePath)}
               className="h-10 w-10 shrink-0 rounded-xl bg-gradient-to-br from-primary to-cyan-500 shadow-md shadow-primary/30"
               aria-label="发送"
             >

@@ -2,10 +2,14 @@
 OmniRAG 配置 — 通过 pydantic-settings 集中管理设置。
 所有值均来自环境变量（参见 .env.example）。
 """
+import os
+
+# ★ 把 HuggingFace 缓存目录迁移到 D 盘
+os.environ.setdefault("HF_HOME", r"D:\hf_cache")
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(

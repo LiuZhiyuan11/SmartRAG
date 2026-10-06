@@ -35,6 +35,8 @@ from app.tools.registry import (
     ROUTING_TOOLS,
     TOOL_TO_ROUTE,
 )
+from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +46,12 @@ logger = logging.getLogger(__name__)
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     query: str
+    image_path: str  # 用于 object_detection 节点，需前端或用户提供
     rag_context: str
     web_context: str
+    weather_city: str  # 用于 get_weather 节点，需前端或用户提供
+    weather_context: str
+    detection_context: str
     draft_answer: str
     final_answer: str
     critique: str
@@ -55,8 +61,12 @@ class AgentState(TypedDict):
     # 路由环（检索后纠错）：链路未命中 / 链路已执行标记
     rag_empty: bool  # RAG 未命中（空结果或弱命中）
     web_empty: bool  # Web 未命中（搜索失败或无结果）
+    weather_empty: bool  # Weather 未命中（查询失败或无结果）
+    detection_empty: bool # 检测到未命中，对方链路未跑 → 补路
     rag_ran: bool    # RAG 链路已执行（防 rag↔web 互补死循环）
     web_ran: bool    # Web 链路已执行
+    weather_ran: bool # Weather 链路已执行
+    detection_ran: bool # 检测到未命中，对方链路未跑 → 补路
 
 
 # ── 路由环：未命中标记检测 ─────────────────────────────────────────────────────
@@ -120,13 +130,20 @@ SUPERVISOR_SYSTEM_PROMPT = """你是监督者，负责为研究查询选择最�
 1. 先判断是否需要检索：
    - 仅问候、寒暄、简单算术等不依赖任何外部信息的问题 → direct_answer（不检索）
    - 其余问题必须选择检索工具，不能只回复文本而不调用工具。
-   - 禁止用自身知识直接回答需要事实依据的问题——天气、新闻、股价等实时信息
+   - 绝对绝对绝对禁止用自身知识直接回答需要事实依据的问题——天气、新闻、股价等实时信息!
      以及文档内容、具体数据，一律必须检索，绝不允许 direct_answer 后编造。
 2. 依据查询语义选择工具：
-   - 问题内容可能来自用户上传的文档（涉及报告、论文、笔记里的内容）→ rag_search
+   -    - 问题内容可能来自用户上传的文档 → rag_search。这包括：
+     * 报告、论文、笔记、README 的内容
+     * 【公司内部信息】公司制度、员工福利、假期政策、绩效考核、招聘信息
+     * 【产品细节】产品功能、定价、技术架构、性能指标
+     * 【具体数据】文档中出现的数字、日期、名称
+     只要问题涉及上述任意一类，必须优先选择 rag_search，禁止走 web_search。
    - 问题涉及外部世界的最新信息、产品或模型 → web_search
    - 需要同时结合内部文档和外部信息 → parallel_search
    - 拿不准时优先 parallel_search，而不是不调用工具。
+   - 如果问题涉及天气，必须使用 get_weather 工具（不走 RAG 或 Web）。另外要从问题中提取城市名（例如用户说"北京天气"，你就提取 city 参数为"北京"）。要处理用户没说城市的情况，例如“今天天气怎么样”，可以先从对话历史里找最近提到的城市；如果仍然没有，就请用户补充城市，而不要猜。
+   - 如果问题涉及图像检测或者图片物体识别内容，务必使用 object_detection 工具（不走 RAG 或 Web）。
 3. 结合对话历史判断意图：追问（如"它呢"）应沿用上一轮的信息源。
 4. 只能选择一个工具调用。"""
 
@@ -142,13 +159,15 @@ async def supervisor_node(state: AgentState) -> AgentState:
     # 因此 rag_context / web_context 此刻恒为空，这里不做"上下文就绪"判断。
     rag_ctx = state.get("rag_context", "")
     web_ctx = state.get("web_context", "")
+    weather_ctx = state.get("weather_context", "")
+    detection_ctx = state.get("detection_context", "")
 
     # Function Calling 路由：LLM 绑定 ROUTING_TOOLS 后自主选择工具，
     # 由 tool_calls[0].name 经 TOOL_TO_ROUTE 映射到 LangGraph route 值。
     llm = get_llm().bind_tools(ROUTING_TOOLS)
     chain = ChatPromptTemplate.from_messages([
         ("system", SUPERVISOR_SYSTEM_PROMPT),
-        ("human", "对话历史:\n{history}\n\n查询: {query}\n已有的 RAG 上下文: {rag_context}\n已有的 Web 上下文: {web_context}"),
+        ("human", "对话历史:\n{history}\n\n查询: {query}\n已有的 RAG 上下文: {rag_context}\n已有的 Web 上下文: {web_context}\n已有的天气上下文: {weather_context}\n已有的检测上下文: {detection_context}"),
     ]) | llm
     response = await asyncio.to_thread(
         chain.invoke,
@@ -157,19 +176,28 @@ async def supervisor_node(state: AgentState) -> AgentState:
             "history": format_history(state.get("messages", [])),
             "rag_context": rag_ctx,
             "web_context": web_ctx,
+            "weather_context": weather_ctx,
+            "detection_context": detection_ctx,
         },
     )
 
     # 解析 tool_calls
     tool_calls = getattr(response, "tool_calls", None) or []
+    weather_city = state.get("weather_city", "")
+
     if tool_calls:
         tool_name = tool_calls[0]["name"]
+        tool_args = tool_calls[0]["args"] or {}
         route = TOOL_TO_ROUTE.get(tool_name, "both")
         direct = tool_name in DIRECT_ANSWER_TOOLS
         logger.info(
             "监督者 function calling: %s → route=%s（%.1fs）",
             tool_name, route, time.perf_counter() - _t,
         )
+
+        if tool_name == "get_weather":
+            weather_city = tool_args.get("city", "").strip()
+            logger.info("提取到城市: %s", weather_city)
     else:
         # 兜底：LLM 未调用工具，默认走双路并行检索
         route = "both"
@@ -178,7 +206,10 @@ async def supervisor_node(state: AgentState) -> AgentState:
             "监督者未返回 tool_calls，兜底 route=both（%.1fs）",
             time.perf_counter() - _t,
         )
-    return {**state, "route": route, "direct_answer": direct}
+    return {**state,
+            "route": route,
+            "direct_answer": direct,
+            "weather_city": weather_city}
 
 
 # ── Agent 节点（全部异步化，同步阻塞调用放入线程池）──────────────────────────
@@ -210,6 +241,65 @@ async def web_node(state: AgentState) -> AgentState:
         "web_ran": True,
     }
 
+async def weather_node(state: AgentState) -> AgentState:
+    from app.tools.registry import get_weather
+    import json
+
+    _t = time.perf_counter()
+    city = state.get("weather_city", "").strip()
+
+    if not city:
+        # 没有城市，返回提示而不是硬查
+        context = "请提供要查询天气的城市。"
+        empty = True
+    else:
+        # ★ 用 StructuredTool 的异步接口 .ainvoke
+        result = await get_weather.ainvoke({"city": city})
+        # 结果是 dict，转成字符串存进 context
+        context = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+        empty = False
+    return {
+        **state,
+        "weather_context": context,
+        "weather_empty": empty,
+        "weather_ran": True,
+    }
+
+async def detection_node(state: AgentState) -> AgentState:
+    from app.tools.registry import object_detection
+
+    _t = time.perf_counter()
+
+    # 从 state 里取图片路径（需要前端或用户提供）
+    image_path = state.get("image_path", "").strip()
+    logger.info(
+        "目标检测节点开始: query=%r image_path=%r",
+        state.get("query", ""),
+        image_path,
+    )
+    if not image_path:
+        raise ValueError("目标检测请求缺少 image_path")
+
+    path = Path(image_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"测试图片不存在: {path}")
+
+    resolved_path = str(path.resolve())
+    logger.info("目标检测节点调用工具: image_path=%s", resolved_path)
+    context = await object_detection.ainvoke({
+        "image_path": resolved_path,
+    })
+    logger.info("目标检测工具返回: %s", context)
+    logger.info("目标检测完成，图片路径: %s", path)
+    logger.info("检测节点耗时 %.1fs", time.perf_counter() - _t)
+    return {
+        **state,
+        "detection_context": context,
+        "detection_empty": context == "没有检测到目标。",
+        "detection_ran": True,
+        "draft_answer": context,
+        "final_answer": context,
+    }
 
 async def both_node(state: AgentState) -> AgentState:
     """RAG 与 Web 检索真正并行执行（asyncio.gather）。
@@ -251,6 +341,11 @@ async def synthesis_node(state: AgentState) -> AgentState:
     """
     _t = time.perf_counter()
     agent = create_synthesis_agent()
+    current_date = datetime.now().strftime("%Y年%m月%d日")
+
+    # 把时间拼接到用户问题里传给写手
+    enriched_query = f"【系统当前日期：{current_date}】\n\n用户问题：{state['query']}"
+
     try:
         from langgraph.config import get_stream_writer
         writer = get_stream_writer()
@@ -259,9 +354,10 @@ async def synthesis_node(state: AgentState) -> AgentState:
 
     parts: list[str] = []
     async for token in agent.arun_stream(
-        state["query"],
+        enriched_query,
         state.get("rag_context", ""),
         state.get("web_context", ""),
+        state.get("weather_context", ""),
         state.get("critique", ""),
         state.get("draft_answer", ""),
         format_history(state.get("messages", [])),
@@ -299,7 +395,7 @@ async def critique_node(
         agent.evaluate,
         state["query"],
         state["draft_answer"],
-        state.get("rag_context", "") + "\n" + state.get("web_context", ""),
+        state.get("rag_context", "") + "\n" + state.get("web_context", "") + "\n" + state.get("weather_context", ""),
     )
     logger.info("评审节点耗时 %.1fs", time.perf_counter() - _t)
     iterations = state.get("iterations", 0) + 1
@@ -348,7 +444,7 @@ def _critique_passed(critique: str) -> bool:
 
 # ── 路由函数 ───────────────────────────────────────────────────────────────────
 
-def route_supervisor(state: AgentState) -> Literal["rag_node", "web_node", "both_node", "synthesis_node"]:
+def route_supervisor(state: AgentState) -> Literal["rag_node", "web_node", "both_node", "synthesis_node", "weather_node", "detection_node"]:
     route = state.get("route", "both")
     direct = state.get("direct_answer", False)
     # 代码层保险：如果上下文都为空且不是直接回答，绝不允许直接 synthesis
@@ -363,6 +459,10 @@ def route_supervisor(state: AgentState) -> Literal["rag_node", "web_node", "both
         return "web_node"
     elif route == "both":
         return "both_node"
+    elif route == "weather_node":
+        return "weather_node"
+    elif route in {"detection_node", "vision_node"}:
+        return "detection_node"  # vision_node 用于兼容旧路由值
     else:
         return "synthesis_node"
 
@@ -422,6 +522,8 @@ def build_graph(checkpointer=None, max_iterations: Optional[int] = None):
     graph.add_node("both_node", both_node)
     graph.add_node("synthesis_node", synthesis_node)
     graph.add_node("critique_node", partial(critique_node, max_iterations=max_iterations))
+    graph.add_node("weather_node", weather_node)
+    graph.add_node("detection_node", detection_node)
 
     graph.add_edge(START, "supervisor")
 
@@ -433,6 +535,8 @@ def build_graph(checkpointer=None, max_iterations: Optional[int] = None):
             "web_node": "web_node",
             "both_node": "both_node",
             "synthesis_node": "synthesis_node",
+            "weather_node": "weather_node",
+            "detection_node": "detection_node",
         },
     )
 
@@ -449,6 +553,8 @@ def build_graph(checkpointer=None, max_iterations: Optional[int] = None):
     )
     graph.add_edge("both_node", "synthesis_node")
 
+    graph.add_edge("weather_node", "synthesis_node")
+    graph.add_edge("detection_node", END)
     # 综合后分流：direct_answer 成功直接结束（跳过评审），失败补路双路检索，
     # 其余进入评审闭环
     graph.add_conditional_edges(
@@ -476,8 +582,16 @@ def _initial_state(query: str) -> AgentState:
     return {
         "messages": [HumanMessage(content=query)],
         "query": query,
+
+        "image_path": "",  # 用于 object_detection 节点，需前端或用户提供
+
         "rag_context": "",
         "web_context": "",
+
+        "weather_city": "",  # 用于 weather_node 节点，需前端或用户提供
+        "weather_context":"",
+        "detection_context":"",
+
         "draft_answer": "",
         "final_answer": "",
         "critique": "",
@@ -485,8 +599,15 @@ def _initial_state(query: str) -> AgentState:
         "route": "",
         "rag_empty": False,
         "web_empty": False,
+
+        "weather_empty": False,
+        "detection_empty": False,
+
         "rag_ran": False,
         "web_ran": False,
+
+        "weather_ran": False,
+        "detection_ran": False,
     }
 
 
@@ -494,6 +615,8 @@ def _initial_state(query: str) -> AgentState:
 def _extract_result(result) -> dict:
     return {
         "final_answer": result.get("final_answer") or result.get("draft_answer"),
+        "detection_context": result.get("detection_context", ""),
+        "detection_ran": result.get("detection_ran", False),
         "rag_context": result.get("rag_context", ""),
         "web_context": result.get("web_context", ""),
         "critique": result.get("critique", ""),
@@ -594,6 +717,7 @@ async def stream_query(
     query: str,
     thread_id: str = "default",
     max_iterations: Optional[int] = None,
+    image_path: str = "",
 ):
     """流式执行管道，逐步产出事件字典（供 SSE 使用）。
 
@@ -614,9 +738,13 @@ async def stream_query(
         graph = build_graph(checkpointer, max_iterations=max_iterations)
         config = {"configurable": {"thread_id": thread_id}}
 
+        initial_state = _initial_state(query)
+        if image_path:
+            initial_state["image_path"] = image_path  # ★ 注入
+
         # updates：节点级状态事件；custom：synthesis_node 透传的逐 token 内容
         async for mode, data in graph.astream(
-            _initial_state(query), config=config, stream_mode=["updates", "custom"]
+            initial_state, config=config, stream_mode=["updates", "custom"]
         ):
             if mode == "updates":
                 for node, frag in data.items():
@@ -625,7 +753,7 @@ async def stream_query(
                         yield event
                     # synthesis_node（direct_answer 直答）或 critique_node（常规闭环）
                     # 都可能是最后产出答案的节点，记录供最终结果提取
-                    if node in ("synthesis_node", "critique_node"):
+                    if node in ("synthesis_node", "critique_node","detection_node"):
                         last_state = frag
             elif mode == "custom":
                 # token 级事件：前端逐字渲染，改善感知延迟

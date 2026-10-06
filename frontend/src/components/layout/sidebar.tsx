@@ -40,7 +40,7 @@ export function Sidebar({
           <BrainCircuit className="h-5 w-5 text-white" />
         </div>
         <div>
-          <div className="text-[15px] font-semibold tracking-tight">OmniRAG</div>
+          <div className="text-[15px] font-semibold tracking-tight">SmartRAG</div>
           <div className="text-[11px] text-muted-foreground">Multi-Agent Hybrid RAG</div>
         </div>
       </div>

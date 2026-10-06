@@ -128,12 +128,13 @@ export function runEval(k?: number, threshold?: number): Promise<EvalResult> {
 export async function streamQuery(
   query: string,
   threadId: string | null,
+  imagePath: string,
   onEvent: (event: StreamEvent) => void,
 ): Promise<void> {
   const res = await fetch("/api/query/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, thread_id: threadId }),
+    body: JSON.stringify({ query, thread_id: threadId , image_path: imagePath }),
   })
   if (!res.ok || !res.body) {
     throw new Error(`流式请求失败 (${res.status})`)
